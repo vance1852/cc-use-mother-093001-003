@@ -9,18 +9,31 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .review import ReviewService
 from .service import DomainService
 from .storage import Database
 
 
+def get_review_service(service: DomainService) -> ReviewService:
+    """复用基础服务的数据库与时钟创建盲审服务（带缓存）。"""
+
+    cached = getattr(service, "_review_service", None)
+    if cached is None:
+        cached = ReviewService(service.database, service.clock)
+        service._review_service = cached
+    return cached
+
+
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          review_service: ReviewService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    review = review_service or get_review_service(service)
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -48,11 +61,86 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        status, payload = _route_review(review, method, parsed, body, actor_id)
+        if status is not None:
+            return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _receipt_response(receipt, created_status: int = 201) -> tuple[int, dict[str, Any]]:
+    return 200 if receipt.replayed else created_status, receipt.__dict__
+
+
+def _route_review(review: ReviewService, method: str, parsed, body: dict[str, Any],
+                  actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts or parts[0] != "review":
+        return None, {}
+
+    if method == "POST" and parts == ["review", "rule-versions"]:
+        return _receipt_response(review.register_rule_version(actor_id=actor_id, **body))
+    if method == "POST" and parts == ["review", "tracks"]:
+        return _receipt_response(review.register_track(actor_id=actor_id, **body))
+    if method == "POST" and parts == ["review", "reviewers"]:
+        return _receipt_response(review.register_reviewer(actor_id=actor_id, **body))
+    if method == "POST" and parts == ["review", "works"]:
+        return _receipt_response(review.register_work(actor_id=actor_id, **body))
+    if method == "POST" and parts == ["review", "relations"]:
+        return _receipt_response(review.declare_relation(actor_id=actor_id, **body))
+    if method == "POST" and parts == ["review", "batches"]:
+        return _receipt_response(review.create_batch(actor_id=actor_id, **body))
+    if method == "GET" and parts == ["review", "my-tasks"]:
+        return 200, review.list_my_tasks(actor_id)
+    if len(parts) == 4 and parts[:2] == ["review", "tasks"]:
+        task_id = parts[2]
+        if method == "GET" and parts[3] == "material":
+            return 200, review.get_task_material(actor_id, task_id)
+        if method == "POST" and parts[3] == "claim":
+            return _receipt_response(review.claim_task(actor_id=actor_id, task_id=task_id, **body))
+        if method == "POST" and parts[3] == "scores":
+            return _receipt_response(review.submit_score(actor_id=actor_id, task_id=task_id, **body))
+        if method == "POST" and parts[3] == "recuse":
+            return _receipt_response(review.recuse_task(actor_id=actor_id, task_id=task_id, **body))
+        if method == "POST" and parts[3] == "invalidate":
+            return _receipt_response(review.invalidate_score(actor_id=actor_id, task_id=task_id, **body))
+    if len(parts) == 3 and parts[:2] == ["review", "snapshots"] and method == "GET":
+        return 200, review.get_snapshot(actor_id, parts[2])
+    if len(parts) >= 3 and parts[:2] == ["review", "batches"]:
+        batch_id = parts[2]
+        if len(parts) == 4:
+            action = parts[3]
+            if method == "POST" and action == "works":
+                return _receipt_response(review.add_work_to_batch(
+                    actor_id=actor_id, batch_id=batch_id, **body))
+            if method == "POST" and action == "exceptions":
+                return _receipt_response(review.grant_exception(
+                    actor_id=actor_id, batch_id=batch_id, **body))
+            if method == "POST" and action == "plan":
+                return _receipt_response(review.generate_plan(
+                    actor_id=actor_id, batch_id=batch_id, **body))
+            if method == "POST" and action == "publish":
+                return _receipt_response(review.publish_batch(
+                    actor_id=actor_id, batch_id=batch_id, **body))
+            if method == "POST" and action == "seal":
+                return _receipt_response(review.seal_batch(
+                    actor_id=actor_id, batch_id=batch_id, **body))
+            if method == "POST" and action == "absences":
+                return _receipt_response(review.mark_absent(
+                    actor_id=actor_id, batch_id=batch_id, **body))
+            if method == "POST" and action == "emergency-assignments":
+                return _receipt_response(review.emergency_assign(
+                    actor_id=actor_id, batch_id=batch_id, **body))
+        if len(parts) == 4 and parts[3] == "report" and method == "GET":
+            return 200, review.get_batch_report(actor_id, batch_id)
+        if (len(parts) == 6 and parts[3] == "works" and parts[5] == "seal"
+                and method == "POST"):
+            return _receipt_response(review.seal_work(
+                actor_id=actor_id, batch_id=batch_id, work_id=parts[4], **body))
+    return 404, {"error": "route_not_found", "message": "接口不存在"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,7 +187,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    service = DomainService(database)
+    get_review_service(service)  # 提前建立盲审表结构
+    Handler.service = service
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
