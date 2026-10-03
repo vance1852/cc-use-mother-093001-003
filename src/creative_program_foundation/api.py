@@ -9,17 +9,26 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .review_service import BlindReviewService
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
           headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
-    """把一个 HTTP 语义请求分派到领域服务。"""
+    """把一个 HTTP 语义请求分派到领域服务。盲审请求分派到 BlindReviewService。"""
 
+    review_service = BlindReviewService(service.database, service.clock)
+    return route_services(service, review_service, method, path, body, headers)
+
+
+def route_services(service: DomainService, review_service: BlindReviewService, method: str,
+                   path: str, body: dict[str, Any] | None,
+                   headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
+    query = parse_qs(parsed.query)
     actor_id = headers.get("X-Actor-Id", "")
     try:
         if method == "GET" and parsed.path == "/health":
@@ -38,14 +47,15 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             receipt = service.record_domain_data(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
         if method == "GET" and parsed.path == "/domain-records":
-            query = parse_qs(parsed.query)
             site_id = query.get("site_id", [""])[0]
             if not site_id:
                 raise ValidationError("site_id 不能为空")
             category = query.get("category", [None])[0]
             return 200, {"items": [item.__dict__ for item in service.list_domain_data(site_id, category)]}
+        status, payload = _route_review(review_service, method, parsed.path, body, query, actor_id)
+        if status is not None:
+            return status, payload
         if method == "GET" and parsed.path == "/audit-events":
-            query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
         return 404, {"error": "route_not_found", "message": "接口不存在"}
@@ -53,6 +63,60 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _route_review(review_service: BlindReviewService, method: str, path: str,
+                  body: dict[str, Any], query: dict[str, list[str]],
+                  actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """盲审后台路由约定。返回 (None, {}) 表示路径不属于盲审模块。"""
+
+    def created(receipt: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        payload = {key: value for key, value in receipt.items() if key != "response"}
+        payload.update(receipt.get("response") or {})
+        return (200 if receipt["replayed"] else 201), payload
+
+    rs = review_service
+    if method == "POST" and path == "/review/disciplines":
+        return created(rs.register_discipline(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/reviewers":
+        return created(rs.register_reviewer(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/works":
+        return created(rs.register_work(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/team-members":
+        return created(rs.register_team_member(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/conflicts":
+        return created(rs.declare_conflict(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/rule-versions":
+        return created(rs.create_rule_version(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/batches":
+        return created(rs.create_batch(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/batches/publish":
+        return created(rs.publish_batch(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/batches/close":
+        return created(rs.close_batch(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/tasks/claim":
+        return created(rs.claim_task(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/tasks/recuse":
+        return created(rs.recuse_task(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/tasks/absent":
+        return created(rs.mark_task_absent(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/scores":
+        return created(rs.submit_score(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/scores/void":
+        return created(rs.void_score(actor_id=actor_id, **body))
+    if method == "POST" and path == "/review/seal":
+        return created(rs.seal_work(actor_id=actor_id, **body))
+    if method == "GET" and path == "/review/my-tasks":
+        return 200, {"items": rs.list_my_tasks(actor_id)}
+    if method == "GET" and path.startswith("/review/my-tasks/"):
+        task_id = path.rsplit("/", 1)[1]
+        return 200, rs.get_my_task(actor_id, task_id)
+    if method == "GET" and path == "/review/batches":
+        return 200, {"items": rs.list_batches(actor_id)}
+    if method == "GET" and path.startswith("/review/batches/") and path.endswith("/audit"):
+        batch_id = path.split("/")[3]
+        return 200, rs.get_batch_audit(actor_id, batch_id)
+    return None, {}
 
 
 class Handler(BaseHTTPRequestHandler):
